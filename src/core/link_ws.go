@@ -3,6 +3,7 @@ package core
 import (
 	"context"
 	"fmt"
+	mrand "math/rand/v2"
 	"net"
 	"net/http"
 	"net/url"
@@ -28,6 +29,20 @@ const fallbackHTML = `<!DOCTYPE html>
 <p><em>Thank you for using nginx.</em></p>
 </body>
 </html>`
+
+const padChars = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+
+func generateRandomPad(minLen, maxLen int) string {
+	length := minLen
+	if maxLen > minLen {
+		length += mrand.IntN(maxLen - minLen + 1)
+	}
+	b := make([]byte, length)
+	for i := range b {
+		b[i] = padChars[mrand.IntN(len(padChars))]
+	}
+	return string(b)
+}
 
 type linkWS struct {
 	phony.Inbox
@@ -80,6 +95,9 @@ func (s *wsServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write([]byte(fallbackHTML))
 		return
 	}
+
+	// Randomize server 101 response packet size to break DPI packet length fingerprinting
+	w.Header().Set("X-Pad", generateRandomPad(32, 256))
 
 	c, err := websocket.Accept(w, r, s.acceptOptions)
 	if err != nil {
@@ -170,6 +188,8 @@ func (l *linkWS) dial(ctx context.Context, url *url.URL, info linkInfo, options 
 		headers.Set("User-Agent", ua)
 		headers.Set("Accept-Language", "en-US,en;q=0.9")
 		headers.Set("Cache-Control", "no-cache")
+		// Randomize client request packet size to break DPI packet length fingerprinting
+		headers.Set("X-Pad", generateRandomPad(64, 512))
 
 		wsconn, _, err := websocket.Dial(ctx, u.String(), &websocket.DialOptions{
 			HTTPClient: &http.Client{

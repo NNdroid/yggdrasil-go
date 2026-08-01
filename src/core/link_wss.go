@@ -56,6 +56,8 @@ func (l *linkWSS) dial(ctx context.Context, url *url.URL, info linkInfo, options
 		headers.Set("User-Agent", ua)
 		headers.Set("Accept-Language", "en-US,en;q=0.9")
 		headers.Set("Cache-Control", "no-cache")
+		// Randomize client request packet size to break DPI packet length fingerprinting
+		headers.Set("X-Pad", generateRandomPad(64, 512))
 
 		wsconn, _, err := websocket.Dial(ctx, u.String(), &websocket.DialOptions{
 			HTTPClient: &http.Client{
