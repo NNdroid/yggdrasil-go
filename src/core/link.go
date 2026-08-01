@@ -40,6 +40,7 @@ type links struct {
 	quic  *linkQUIC  // QUIC interface support
 	ws    *linkWS    // WS interface support
 	wss   *linkWSS   // WSS interface support
+	kcp   *linkKCP   // KCP interface support
 	// _links can only be modified safely from within the links actor
 	_links     map[linkInfo]*link // *link is nil if connection in progress
 	_listeners map[*Listener]context.CancelFunc
@@ -96,6 +97,7 @@ func (l *links) init(c *Core) error {
 	l.quic = l.newLinkQUIC()
 	l.ws = l.newLinkWS()
 	l.wss = l.newLinkWSS()
+	l.kcp = l.newLinkKCP(l.tcp)
 	l._links = make(map[linkInfo]*link)
 	l._listeners = make(map[*Listener]context.CancelFunc)
 
@@ -459,6 +461,8 @@ func (l *links) listen(u *url.URL, sintf string, local bool) (*Listener, error) 
 		protocol = l.ws
 	case "wss":
 		protocol = l.wss
+	case "kcp":
+		protocol = l.kcp
 	default:
 		ctxcancel()
 		return nil, ErrLinkUnrecognisedSchema
@@ -618,6 +622,8 @@ func (l *links) dialerFor(u *url.URL) (linkProtocol, error) {
 		dialer = l.ws
 	case "wss":
 		dialer = l.wss
+	case "kcp":
+		dialer = l.kcp
 	default:
 		return nil, ErrLinkUnrecognisedSchema
 	}
