@@ -35,6 +35,7 @@ func parseRateBytesPerSec(rateStr string) uint64 {
 	if rateStr == "" {
 		return 0
 	}
+	isBps := false
 	var mult uint64 = 1
 	if strings.HasSuffix(rateStr, "M") || strings.HasSuffix(rateStr, "MBPS") {
 		mult = 1000 * 1000 / 8
@@ -46,13 +47,16 @@ func parseRateBytesPerSec(rateStr string) uint64 {
 		mult = 1000 / 8
 		rateStr = strings.TrimSuffix(strings.TrimSuffix(rateStr, "KBPS"), "K")
 	} else if strings.HasSuffix(rateStr, "BPS") {
-		mult = 1 / 8
+		isBps = true
 		rateStr = strings.TrimSuffix(rateStr, "BPS")
 	}
 
 	val, err := strconv.ParseUint(rateStr, 10, 64)
 	if err != nil {
 		return 0
+	}
+	if isBps {
+		return val / 8
 	}
 	return val * mult
 }

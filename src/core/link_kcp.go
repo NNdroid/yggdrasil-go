@@ -386,7 +386,7 @@ func (l *linkKCPListener) Accept() (net.Conn, error) {
 		default:
 		}
 
-		sess, err := l.Listener.AcceptKCP()
+		sess, err := l.AcceptKCP()
 		if err != nil {
 			return nil, err
 		}
@@ -395,7 +395,6 @@ func (l *linkKCPListener) Accept() (net.Conn, error) {
 		sess.SetWindowSize(4096, 4096)
 		sess.SetMtu(1350)
 		sess.SetACKNoDelay(true)
-		sess.SetStreamMode(true)
 		_ = sess.SetReadBuffer(16777216)
 		_ = sess.SetWriteBuffer(16777216)
 
@@ -485,7 +484,6 @@ func (l *linkKCP) dial(ctx context.Context, u *url.URL, info linkInfo, options l
 			sess.SetWindowSize(sndwnd, rcvwnd)
 			sess.SetMtu(1350)
 			sess.SetACKNoDelay(true)
-			sess.SetStreamMode(true)
 			_ = sess.SetReadBuffer(16777216)
 			_ = sess.SetWriteBuffer(16777216)
 			return sess, nil
