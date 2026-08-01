@@ -75,6 +75,18 @@ func parseTCPCongestionParams(u *url.URL) (cc string, rate uint64) {
 	return
 }
 
+func parseMPTCPParam(u *url.URL) bool {
+	if u == nil {
+		return false
+	}
+	q := u.Query()
+	val := strings.ToLower(q.Get("mptcp"))
+	if val == "" {
+		val = strings.ToLower(q.Get("multipath"))
+	}
+	return val == "true" || val == "1" || val == "yes" || val == "on"
+}
+
 func (l *linkTCP) dial(ctx context.Context, url *url.URL, info linkInfo, options linkOptions) (net.Conn, error) {
 	return l.findSuitableIP(url, func(hostname string, ip net.IP, port int) (net.Conn, error) {
 		addr := &net.TCPAddr{
@@ -85,7 +97,13 @@ func (l *linkTCP) dial(ctx context.Context, url *url.URL, info linkInfo, options
 		if err != nil {
 			return nil, err
 		}
-		return dialer.DialContext(ctx, "tcp", addr.String())
+		conn, err := dialer.DialContext(ctx, "tcp", addr.String())
+		if err != nil && dialer.MultipathTCP() {
+			// Automatic fallback to standard TCP if MPTCP socket dial failed on kernel
+			dialer.SetMultipathTCP(false)
+			return dialer.DialContext(ctx, "tcp", addr.String())
+		}
+		return conn, err
 	})
 }
 
@@ -97,11 +115,23 @@ func (l *linkTCP) listen(ctx context.Context, url *url.URL, sintf string) (net.L
 		}
 	}
 	cc, rate := parseTCPCongestionParams(url)
+	mptcp := parseMPTCPParam(url)
+
 	lc := &net.ListenConfig{
 		KeepAlive: -1,
 		Control:   l.getControl(sintf, cc, rate),
 	}
-	return lc.Listen(ctx, "tcp", hostport)
+	if mptcp {
+		lc.SetMultipathTCP(true)
+	}
+
+	listener, err := lc.Listen(ctx, "tcp", hostport)
+	if err != nil && mptcp {
+		// Automatic fallback to standard TCP if MPTCP listen failed on kernel
+		lc.SetMultipathTCP(false)
+		return lc.Listen(ctx, "tcp", hostport)
+	}
+	return listener, err
 }
 
 func (l *linkTCP) dialerFor(dst *net.TCPAddr, sintf string, u *url.URL) (*net.Dialer, error) {
@@ -114,11 +144,17 @@ func (l *linkTCP) dialerFor(dst *net.TCPAddr, sintf string, u *url.URL) (*net.Di
 		}
 	}
 	cc, rate := parseTCPCongestionParams(u)
+	mptcp := parseMPTCPParam(u)
+
 	dialer := &net.Dialer{
 		Timeout:   time.Second * 5,
 		KeepAlive: -1,
 		Control:   l.getControl(sintf, cc, rate),
 	}
+	if mptcp {
+		dialer.SetMultipathTCP(true)
+	}
+
 	if sintf != "" {
 		dialer.Control = l.getControl(sintf, cc, rate)
 		ief, err := net.InterfaceByName(sintf)

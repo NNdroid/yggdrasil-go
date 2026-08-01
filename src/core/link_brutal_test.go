@@ -47,3 +47,22 @@ func TestTCPBrutalParamsParsing(t *testing.T) {
 		t.Fatalf("parseTCPCongestionParams got cc=%s, rate=%d", cc2, rate2)
 	}
 }
+
+func TestMPTCPParamParsing(t *testing.T) {
+	t.Parallel()
+
+	u1, _ := url.Parse("tcp://1.2.3.4:9001?mptcp=true")
+	if !parseMPTCPParam(u1) {
+		t.Fatal("expected parseMPTCPParam to be true for mptcp=true")
+	}
+
+	u2, _ := url.Parse("wss://domain.com/ws?mptcp=1")
+	if !parseMPTCPParam(u2) {
+		t.Fatal("expected parseMPTCPParam to be true for mptcp=1")
+	}
+
+	u3, _ := url.Parse("tcp://1.2.3.4:9001")
+	if parseMPTCPParam(u3) {
+		t.Fatal("expected parseMPTCPParam to be false for missing mptcp param")
+	}
+}
