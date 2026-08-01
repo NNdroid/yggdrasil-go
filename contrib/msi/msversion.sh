@@ -5,8 +5,7 @@ TAG=$(git describe --abbrev=0 --tags --match="v[0-9]*\.[0-9]*\.[0-9]*" 2>/dev/nu
 
 # Did getting the tag succeed?
 if [ $? != 0 ] || [ -z "$TAG" ]; then
-  printf -- "unknown"
-  exit 0
+  TAG="v0.5.0"
 fi
 
 # Get the current branch
@@ -22,6 +21,11 @@ MAJOR=$(echo $TAG | cut -c 2- | cut -d "." -f 1)
 MINOR=$(echo $TAG | cut -c 2- | cut -d "." -f 2)
 PATCH=$(echo $TAG | cut -c 2- | cut -d "." -f 3 | awk -F"rc" '{print $1}')
 
+# Default fallback if empty
+[ -z "$MAJOR" ] && MAJOR=0
+[ -z "$MINOR" ] && MINOR=5
+[ -z "$PATCH" ] && PATCH=0
+
 # Output in the desired format
 if [ $((PATCH)) -eq 0 ]; then
   printf '%s%d.%d' "$PREPEND" "$((MAJOR))" "$((MINOR))"
@@ -35,8 +39,10 @@ if [ "$BRANCH" != "master" ]; then
 
   # Did getting the count of commits since the tag succeed?
   if [ $? != 0 ] || [ -z "$BUILD" ]; then
-    printf -- "-unknown"
-    exit 0
+    BUILD=$(git rev-list --count HEAD 2>/dev/null)
+    if [ $? != 0 ] || [ -z "$BUILD" ]; then
+      BUILD=0
+    fi
   fi
 
   # Is the build greater than zero?
