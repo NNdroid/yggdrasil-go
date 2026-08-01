@@ -2,10 +2,11 @@ package core
 
 import (
 	"context"
-	"crypto/rand"
 	"encoding/binary"
 	"fmt"
 	"io"
+
+	mrand "math/rand/v2"
 	"net"
 	"net/url"
 	"strconv"
@@ -20,8 +21,10 @@ import (
 
 const (
 	stunMagicCookie           uint32 = 0x2112A442
+	stunTypeBindingRequest    uint16 = 0x0001
 	stunTypeBindingIndication uint16 = 0x0011
 	stunAttrTypeData          uint16 = 0x0013
+	stunAttrTypePadding       uint16 = 0x0015
 	stunHeaderLen                    = 20
 	stunAttrHeaderLen                = 4
 )
@@ -35,20 +38,52 @@ var stunBufPool = sync.Pool{
 	},
 }
 
+// fillFastTransactionID fills a 12-byte STUN transaction ID using fast pseudo-random generation.
+func fillFastTransactionID(b []byte) {
+	u1 := mrand.Uint64()
+	u2 := mrand.Uint32()
+	binary.BigEndian.PutUint64(b[0:8], u1)
+	binary.BigEndian.PutUint32(b[8:12], u2)
+}
+
 // stunPacketConn wraps a net.PacketConn to obfuscate KCP packets as STUN packets.
 type stunPacketConn struct {
 	net.PacketConn
+	msgType     uint16
+	mixMsgType  bool
+	randPadding bool
 }
 
-func newSTUNPacketConn(conn net.PacketConn) *stunPacketConn {
-	return &stunPacketConn{PacketConn: conn}
+func newSTUNPacketConn(conn net.PacketConn, msgMode string, randPad bool) *stunPacketConn {
+	mType := stunTypeBindingIndication
+	mix := false
+	switch strings.ToLower(msgMode) {
+	case "request", "req":
+		mType = stunTypeBindingRequest
+	case "mix", "both":
+		mix = true
+	}
+	return &stunPacketConn{
+		PacketConn:  conn,
+		msgType:     mType,
+		mixMsgType:  mix,
+		randPadding: randPad,
+	}
 }
 
 func (c *stunPacketConn) WriteTo(p []byte, addr net.Addr) (int, error) {
 	payloadLen := len(p)
 	padLen := (4 - (payloadLen % 4)) % 4
-	attrTotalLen := stunAttrHeaderLen + payloadLen + padLen
-	stunMsgLen := attrTotalLen
+	dataAttrTotalLen := stunAttrHeaderLen + payloadLen + padLen
+
+	extraPadAttrLen := 0
+	if c.randPadding {
+		// Add random STUN padding attribute (4, 8, 12, 16 bytes)
+		r := int(mrand.Uint32()%4 + 1)
+		extraPadAttrLen = stunAttrHeaderLen + r*4
+	}
+
+	stunMsgLen := dataAttrTotalLen + extraPadAttrLen
 	totalLen := stunHeaderLen + stunMsgLen
 
 	bufPtr := stunBufPool.Get().(*[]byte)
@@ -58,10 +93,18 @@ func (c *stunPacketConn) WriteTo(p []byte, addr net.Addr) (int, error) {
 	}
 
 	// STUN Header (20 bytes)
-	binary.BigEndian.PutUint16(buf[0:2], stunTypeBindingIndication)
+	curMsgType := c.msgType
+	if c.mixMsgType {
+		if mrand.Uint32()%2 == 0 {
+			curMsgType = stunTypeBindingRequest
+		} else {
+			curMsgType = stunTypeBindingIndication
+		}
+	}
+	binary.BigEndian.PutUint16(buf[0:2], curMsgType)
 	binary.BigEndian.PutUint16(buf[2:4], uint16(stunMsgLen))
 	binary.BigEndian.PutUint32(buf[4:8], stunMagicCookie)
-	_, _ = rand.Read(buf[8:20])
+	fillFastTransactionID(buf[8:20])
 
 	// STUN DATA Attribute Header (4 bytes)
 	binary.BigEndian.PutUint16(buf[20:22], stunAttrTypeData)
@@ -70,6 +113,17 @@ func (c *stunPacketConn) WriteTo(p []byte, addr net.Addr) (int, error) {
 	copy(buf[24:24+payloadLen], p)
 	for i := 0; i < padLen; i++ {
 		buf[24+payloadLen+i] = 0
+	}
+
+	// Optional Random Padding Attribute Header
+	if extraPadAttrLen > 0 {
+		pos := 24 + payloadLen + padLen
+		binary.BigEndian.PutUint16(buf[pos:pos+2], stunAttrTypePadding)
+		padContentLen := extraPadAttrLen - stunAttrHeaderLen
+		binary.BigEndian.PutUint16(buf[pos+2:pos+4], uint16(padContentLen))
+		for i := 0; i < padContentLen; i++ {
+			buf[pos+4+i] = byte(mrand.Uint32())
+		}
 	}
 
 	_, err := c.PacketConn.WriteTo(buf[:totalLen], addr)
@@ -91,6 +145,10 @@ func (c *stunPacketConn) ReadFrom(p []byte) (int, net.Addr, error) {
 			return 0, addr, err
 		}
 		if nRaw < stunHeaderLen+stunAttrHeaderLen {
+			continue
+		}
+		msgType := binary.BigEndian.Uint16(rawBuf[0:2])
+		if msgType != stunTypeBindingIndication && msgType != stunTypeBindingRequest {
 			continue
 		}
 		if binary.BigEndian.Uint32(rawBuf[4:8]) != stunMagicCookie {
@@ -124,7 +182,7 @@ func (c *stunPacketConn) ReadFrom(p []byte) (int, net.Addr, error) {
 	}
 }
 
-func parseKCPParams(u *url.URL) (conns int, sndwnd int, rcvwnd int, dataShards int, parityShards int) {
+func parseKCPParams(u *url.URL) (conns int, sndwnd int, rcvwnd int, dataShards int, parityShards int, msgMode string, randPad bool) {
 	conns = 1
 	sndwnd = 1024
 	rcvwnd = 1024
@@ -155,6 +213,11 @@ func parseKCPParams(u *url.URL) (conns int, sndwnd int, rcvwnd int, dataShards i
 				parityShards = ps
 			}
 		}
+	}
+	msgMode = q.Get("stun_msg")
+	padVal := q.Get("padding")
+	if padVal == "rand" || padVal == "true" || padVal == "1" {
+		randPad = true
 	}
 	return
 }
@@ -383,7 +446,7 @@ func (l *links) newLinkKCP(tcp *linkTCP) *linkKCP {
 }
 
 func (l *linkKCP) dial(ctx context.Context, u *url.URL, info linkInfo, options linkOptions) (net.Conn, error) {
-	conns, sndwnd, rcvwnd, dataShards, parityShards := parseKCPParams(u)
+	conns, sndwnd, rcvwnd, dataShards, parityShards, msgMode, randPad := parseKCPParams(u)
 
 	return l.findSuitableIP(u, func(hostname string, ip net.IP, port int) (net.Conn, error) {
 		raddr := &net.UDPAddr{
@@ -402,7 +465,7 @@ func (l *linkKCP) dial(ctx context.Context, u *url.URL, info linkInfo, options l
 			if err != nil {
 				return nil, err
 			}
-			stunConn := newSTUNPacketConn(packetConn)
+			stunConn := newSTUNPacketConn(packetConn, msgMode, randPad)
 			sess, err := kcp.NewConn2(raddr, nil, dataShards, parityShards, stunConn)
 			if err != nil {
 				_ = stunConn.Close()
@@ -424,7 +487,8 @@ func (l *linkKCP) dial(ctx context.Context, u *url.URL, info linkInfo, options l
 
 		// Multi-connection bundle
 		var bundleID [16]byte
-		_, _ = rand.Read(bundleID[:])
+		fillFastTransactionID(bundleID[:12])
+		fillFastTransactionID(bundleID[4:16])
 
 		sessions := make([]net.Conn, conns)
 		for i := 0; i < conns; i++ {
@@ -455,7 +519,7 @@ func (l *linkKCP) dial(ctx context.Context, u *url.URL, info linkInfo, options l
 }
 
 func (l *linkKCP) listen(ctx context.Context, u *url.URL, sintf string) (net.Listener, error) {
-	_, _, _, dataShards, parityShards := parseKCPParams(u)
+	_, _, _, dataShards, parityShards, msgMode, randPad := parseKCPParams(u)
 
 	hostport := u.Host
 	if sintf != "" {
@@ -467,7 +531,7 @@ func (l *linkKCP) listen(ctx context.Context, u *url.URL, sintf string) (net.Lis
 	if err != nil {
 		return nil, err
 	}
-	stunConn := newSTUNPacketConn(packetConn)
+	stunConn := newSTUNPacketConn(packetConn, msgMode, randPad)
 	listener, err := kcp.ServeConn(nil, dataShards, parityShards, stunConn)
 	if err != nil {
 		_ = stunConn.Close()

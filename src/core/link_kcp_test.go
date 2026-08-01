@@ -24,8 +24,8 @@ func TestSTUNPacketConn(t *testing.T) {
 	}
 	defer pc2.Close()
 
-	s1 := newSTUNPacketConn(pc1)
-	s2 := newSTUNPacketConn(pc2)
+	s1 := newSTUNPacketConn(pc1, "", false)
+	s2 := newSTUNPacketConn(pc2, "", false)
 
 	payload := []byte("hello kcp stun obfuscation world!")
 
