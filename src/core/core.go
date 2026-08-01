@@ -245,21 +245,17 @@ func (c *Core) WriteToAllPeers(p []byte, addr net.Addr) (n int, err error) {
 
 	peers := c.GetPeers()
 	if len(peers) > 1 {
-		data := make([]byte, len(p))
-		copy(data, p)
-		go func() {
-			for _, peer := range peers {
-				peerKey := peer.Key
-				targetAddr := iwt.Addr(peerKey)
-				if targetAddrStr, ok := addr.(iwt.Addr); !ok || !bytes.Equal(targetAddr, targetAddrStr) {
-					dupBuf := allocBytes(0)
-					dupBuf = append(dupBuf, typeSessionTraffic)
-					dupBuf = append(dupBuf, data...)
-					_, _ = c.PacketConn.WriteTo(dupBuf, targetAddr)
-					freeBytes(dupBuf)
-				}
+		for _, peer := range peers {
+			peerKey := peer.Key
+			targetAddr := iwt.Addr(peerKey)
+			if targetAddrStr, ok := addr.(iwt.Addr); !ok || !bytes.Equal(targetAddr, targetAddrStr) {
+				dupBuf := allocBytes(0)
+				dupBuf = append(dupBuf, typeSessionTraffic)
+				dupBuf = append(dupBuf, p...)
+				_, _ = c.PacketConn.WriteTo(dupBuf, targetAddr)
+				freeBytes(dupBuf)
 			}
-		}()
+		}
 	}
 	return
 }

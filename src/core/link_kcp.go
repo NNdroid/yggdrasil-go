@@ -31,9 +31,17 @@ const (
 
 var bundleMagic = [4]byte{'K', 'C', 'P', 'B'}
 
+// stunBufPool uses 65535 byte buffers to ensure no UDP packet truncation occurs
 var stunBufPool = sync.Pool{
 	New: func() any {
-		b := make([]byte, 2048)
+		b := make([]byte, 65535)
+		return &b
+	},
+}
+
+var multiKCPBufPool = sync.Pool{
+	New: func() any {
+		b := make([]byte, 16384)
 		return &b
 	},
 }
@@ -78,7 +86,6 @@ func (c *stunPacketConn) WriteTo(p []byte, addr net.Addr) (int, error) {
 
 	extraPadAttrLen := 0
 	if c.randPadding {
-		// Add random STUN padding attribute (4, 8, 12, 16 bytes)
 		r := int(mrand.Uint32()%4 + 1)
 		extraPadAttrLen = stunAttrHeaderLen + r*4
 	}
@@ -184,8 +191,8 @@ func (c *stunPacketConn) ReadFrom(p []byte) (int, net.Addr, error) {
 
 func parseKCPParams(u *url.URL) (conns int, sndwnd int, rcvwnd int, dataShards int, parityShards int, msgMode string, randPad bool) {
 	conns = 1
-	sndwnd = 1024
-	rcvwnd = 1024
+	sndwnd = 4096
+	rcvwnd = 4096
 
 	q := u.Query()
 	if val := q.Get("conns"); val != "" {
@@ -250,7 +257,7 @@ func newMultiKCPConn(conns []net.Conn) *multiKCPConn {
 	ctx, cancel := context.WithCancel(context.Background())
 	m := &multiKCPConn{
 		conns:  conns,
-		readCh: make(chan []byte, 512),
+		readCh: make(chan []byte, 4096),
 		ctx:    ctx,
 		cancel: cancel,
 	}
@@ -258,15 +265,18 @@ func newMultiKCPConn(conns []net.Conn) *multiKCPConn {
 		conn := c
 		go func() {
 			for {
-				buf := make([]byte, 4096)
+				bufPtr := multiKCPBufPool.Get().(*[]byte)
+				buf := *bufPtr
 				n, err := conn.Read(buf)
 				if err != nil {
+					multiKCPBufPool.Put(bufPtr)
 					m.cancel()
 					return
 				}
 				select {
 				case m.readCh <- buf[:n]:
 				case <-m.ctx.Done():
+					multiKCPBufPool.Put(bufPtr)
 					return
 				}
 			}
@@ -382,12 +392,12 @@ func (l *linkKCPListener) Accept() (net.Conn, error) {
 		}
 		// Apply optimal KCP performance tuning
 		sess.SetNoDelay(1, 10, 2, 1)
-		sess.SetWindowSize(1024, 1024)
+		sess.SetWindowSize(4096, 4096)
 		sess.SetMtu(1350)
 		sess.SetACKNoDelay(true)
 		sess.SetStreamMode(true)
-		_ = sess.SetReadBuffer(4194304)
-		_ = sess.SetWriteBuffer(4194304)
+		_ = sess.SetReadBuffer(16777216)
+		_ = sess.SetWriteBuffer(16777216)
 
 		// Read magic prefix to determine if bundled connection
 		hdr := make([]byte, 22)
@@ -476,8 +486,8 @@ func (l *linkKCP) dial(ctx context.Context, u *url.URL, info linkInfo, options l
 			sess.SetMtu(1350)
 			sess.SetACKNoDelay(true)
 			sess.SetStreamMode(true)
-			_ = sess.SetReadBuffer(4194304)
-			_ = sess.SetWriteBuffer(4194304)
+			_ = sess.SetReadBuffer(16777216)
+			_ = sess.SetWriteBuffer(16777216)
 			return sess, nil
 		}
 
