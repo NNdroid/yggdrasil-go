@@ -136,3 +136,52 @@ func TestKCPPeering(t *testing.T) {
 		t.Fatalf("nodeB unexpected number of peers: %d", l)
 	}
 }
+
+func TestKCPMultiConnsAndFEC(t *testing.T) {
+	cfgA, cfgB := config.GenerateConfig(), config.GenerateConfig()
+	if err := cfgA.GenerateSelfSignedCertificate(); err != nil {
+		t.Fatal(err)
+	}
+	if err := cfgB.GenerateSelfSignedCertificate(); err != nil {
+		t.Fatal(err)
+	}
+
+	logger := GetLoggerWithPrefix("", false)
+
+	nodeA, err := New(cfgA.Certificate, logger)
+	if err != nil {
+		t.Fatal(err)
+	}
+	nodeB, err := New(cfgB.Certificate, logger)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	nodeAListenURL, err := url.Parse("kcp://127.0.0.1:0?fec=10:3&sndwnd=2048&rcvwnd=2048")
+	if err != nil {
+		t.Fatal(err)
+	}
+	nodeAListener, err := nodeA.Listen(nodeAListenURL, "")
+	if err != nil {
+		t.Fatalf("nodeA failed to listen on KCP: %v", err)
+	}
+	defer nodeAListener.Cancel()
+
+	nodeAURL, err := url.Parse("kcp://" + nodeAListener.Addr().String() + "?conns=4&fec=10:3&sndwnd=2048&rcvwnd=2048")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err = nodeB.CallPeer(nodeAURL, ""); err != nil {
+		t.Fatalf("nodeB failed to call nodeA over multi-channel KCP: %v", err)
+	}
+
+	time.Sleep(800 * time.Millisecond)
+
+	if l := len(nodeA.GetPeers()); l != 1 {
+		t.Fatalf("nodeA unexpected number of peers: %d", l)
+	}
+	if l := len(nodeB.GetPeers()); l != 1 {
+		t.Fatalf("nodeB unexpected number of peers: %d", l)
+	}
+}

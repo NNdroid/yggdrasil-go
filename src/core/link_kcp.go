@@ -5,9 +5,14 @@ import (
 	"crypto/rand"
 	"encoding/binary"
 	"fmt"
+	"io"
 	"net"
 	"net/url"
+	"strconv"
+	"strings"
 	"sync"
+	"sync/atomic"
+	"time"
 
 	"github.com/Arceliar/phony"
 	"github.com/xtaci/kcp-go/v5"
@@ -20,6 +25,8 @@ const (
 	stunHeaderLen                    = 20
 	stunAttrHeaderLen                = 4
 )
+
+var bundleMagic = [4]byte{'K', 'C', 'P', 'B'}
 
 var stunBufPool = sync.Pool{
 	New: func() any {
@@ -51,23 +58,16 @@ func (c *stunPacketConn) WriteTo(p []byte, addr net.Addr) (int, error) {
 	}
 
 	// STUN Header (20 bytes)
-	// Message Type: 0x0011 (Binding Indication)
 	binary.BigEndian.PutUint16(buf[0:2], stunTypeBindingIndication)
-	// Message Length
 	binary.BigEndian.PutUint16(buf[2:4], uint16(stunMsgLen))
-	// Magic Cookie
 	binary.BigEndian.PutUint32(buf[4:8], stunMagicCookie)
-	// Transaction ID (12 bytes pseudo-random/random)
 	_, _ = rand.Read(buf[8:20])
 
 	// STUN DATA Attribute Header (4 bytes)
 	binary.BigEndian.PutUint16(buf[20:22], stunAttrTypeData)
 	binary.BigEndian.PutUint16(buf[22:24], uint16(payloadLen))
 
-	// Attribute Payload
 	copy(buf[24:24+payloadLen], p)
-
-	// Padding bytes
 	for i := 0; i < padLen; i++ {
 		buf[24+payloadLen+i] = 0
 	}
@@ -124,6 +124,165 @@ func (c *stunPacketConn) ReadFrom(p []byte) (int, net.Addr, error) {
 	}
 }
 
+func parseKCPParams(u *url.URL) (conns int, sndwnd int, rcvwnd int, dataShards int, parityShards int) {
+	conns = 1
+	sndwnd = 1024
+	rcvwnd = 1024
+
+	q := u.Query()
+	if val := q.Get("conns"); val != "" {
+		if n, err := strconv.Atoi(val); err == nil && n >= 1 && n <= 64 {
+			conns = n
+		}
+	}
+	if val := q.Get("sndwnd"); val != "" {
+		if n, err := strconv.Atoi(val); err == nil && n > 0 {
+			sndwnd = n
+		}
+	}
+	if val := q.Get("rcvwnd"); val != "" {
+		if n, err := strconv.Atoi(val); err == nil && n > 0 {
+			rcvwnd = n
+		}
+	}
+	if val := q.Get("fec"); val != "" {
+		parts := strings.Split(val, ":")
+		if len(parts) == 2 {
+			ds, err1 := strconv.Atoi(parts[0])
+			ps, err2 := strconv.Atoi(parts[1])
+			if err1 == nil && err2 == nil && ds >= 0 && ps >= 0 {
+				dataShards = ds
+				parityShards = ps
+			}
+		}
+	}
+	return
+}
+
+type prefixConn struct {
+	net.Conn
+	prefix []byte
+}
+
+func (p *prefixConn) Read(b []byte) (int, error) {
+	if len(p.prefix) > 0 {
+		n := copy(b, p.prefix)
+		p.prefix = p.prefix[n:]
+		return n, nil
+	}
+	return p.Conn.Read(b)
+}
+
+type multiKCPConn struct {
+	conns     []net.Conn
+	txIdx     uint64
+	readCh    chan []byte
+	unreadBuf []byte
+	closeOnce sync.Once
+	ctx       context.Context
+	cancel    context.CancelFunc
+}
+
+func newMultiKCPConn(conns []net.Conn) *multiKCPConn {
+	ctx, cancel := context.WithCancel(context.Background())
+	m := &multiKCPConn{
+		conns:  conns,
+		readCh: make(chan []byte, 512),
+		ctx:    ctx,
+		cancel: cancel,
+	}
+	for _, c := range conns {
+		conn := c
+		go func() {
+			for {
+				buf := make([]byte, 4096)
+				n, err := conn.Read(buf)
+				if err != nil {
+					m.cancel()
+					return
+				}
+				select {
+				case m.readCh <- buf[:n]:
+				case <-m.ctx.Done():
+					return
+				}
+			}
+		}()
+	}
+	return m
+}
+
+func (m *multiKCPConn) Read(b []byte) (int, error) {
+	if len(m.unreadBuf) > 0 {
+		n := copy(b, m.unreadBuf)
+		m.unreadBuf = m.unreadBuf[n:]
+		return n, nil
+	}
+	select {
+	case data, ok := <-m.readCh:
+		if !ok {
+			return 0, io.EOF
+		}
+		n := copy(b, data)
+		if n < len(data) {
+			m.unreadBuf = make([]byte, len(data)-n)
+			copy(m.unreadBuf, data[n:])
+		}
+		return n, nil
+	case <-m.ctx.Done():
+		return 0, io.EOF
+	}
+}
+
+func (m *multiKCPConn) Write(b []byte) (int, error) {
+	select {
+	case <-m.ctx.Done():
+		return 0, io.EOF
+	default:
+	}
+	idx := atomic.AddUint64(&m.txIdx, 1) % uint64(len(m.conns))
+	return m.conns[idx].Write(b)
+}
+
+func (m *multiKCPConn) Close() error {
+	m.closeOnce.Do(func() {
+		m.cancel()
+		for _, c := range m.conns {
+			_ = c.Close()
+		}
+	})
+	return nil
+}
+
+func (m *multiKCPConn) LocalAddr() net.Addr {
+	return m.conns[0].LocalAddr()
+}
+
+func (m *multiKCPConn) RemoteAddr() net.Addr {
+	return m.conns[0].RemoteAddr()
+}
+
+func (m *multiKCPConn) SetDeadline(t time.Time) error {
+	for _, c := range m.conns {
+		_ = c.SetDeadline(t)
+	}
+	return nil
+}
+
+func (m *multiKCPConn) SetReadDeadline(t time.Time) error {
+	for _, c := range m.conns {
+		_ = c.SetReadDeadline(t)
+	}
+	return nil
+}
+
+func (m *multiKCPConn) SetWriteDeadline(t time.Time) error {
+	for _, c := range m.conns {
+		_ = c.SetWriteDeadline(t)
+	}
+	return nil
+}
+
 type linkKCP struct {
 	phony.Inbox
 	*links
@@ -131,24 +290,85 @@ type linkKCP struct {
 	listenconfig *net.ListenConfig
 }
 
+type pendingBundle struct {
+	total int
+	conns map[int]net.Conn
+}
+
 type linkKCPListener struct {
 	*kcp.Listener
+	mu      sync.Mutex
+	pending map[[16]byte]*pendingBundle
+	ready   chan net.Conn
 }
 
 func (l *linkKCPListener) Accept() (net.Conn, error) {
-	sess, err := l.Listener.AcceptKCP()
-	if err != nil {
-		return nil, err
+	for {
+		select {
+		case conn, ok := <-l.ready:
+			if !ok {
+				return nil, net.ErrClosed
+			}
+			return conn, nil
+		default:
+		}
+
+		sess, err := l.Listener.AcceptKCP()
+		if err != nil {
+			return nil, err
+		}
+		// Apply optimal KCP performance tuning
+		sess.SetNoDelay(1, 10, 2, 1)
+		sess.SetWindowSize(1024, 1024)
+		sess.SetMtu(1350)
+		sess.SetACKNoDelay(true)
+		sess.SetStreamMode(true)
+		_ = sess.SetReadBuffer(4194304)
+		_ = sess.SetWriteBuffer(4194304)
+
+		// Read magic prefix to determine if bundled connection
+		hdr := make([]byte, 22)
+		_ = sess.SetReadDeadline(time.Now().Add(time.Second * 3))
+		n, err := io.ReadFull(sess, hdr)
+		_ = sess.SetReadDeadline(time.Time{})
+
+		if err != nil || n < 22 || string(hdr[0:4]) != "KCPB" {
+			// Single session connection or error
+			var unread []byte
+			if n > 0 {
+				unread = hdr[:n]
+			}
+			return &prefixConn{Conn: sess, prefix: unread}, nil
+		}
+
+		// Bundle header parsed
+		var bundleID [16]byte
+		copy(bundleID[:], hdr[4:20])
+		idx := int(hdr[20])
+		total := int(hdr[21])
+
+		l.mu.Lock()
+		b, exists := l.pending[bundleID]
+		if !exists {
+			b = &pendingBundle{
+				total: total,
+				conns: make(map[int]net.Conn),
+			}
+			l.pending[bundleID] = b
+		}
+		b.conns[idx] = sess
+
+		if len(b.conns) == b.total {
+			delete(l.pending, bundleID)
+			orderedConns := make([]net.Conn, b.total)
+			for i := 0; i < b.total; i++ {
+				orderedConns[i] = b.conns[i]
+			}
+			l.mu.Unlock()
+			return newMultiKCPConn(orderedConns), nil
+		}
+		l.mu.Unlock()
 	}
-	// Best performance tuning
-	sess.SetNoDelay(1, 10, 2, 1)
-	sess.SetWindowSize(1024, 1024)
-	sess.SetMtu(1350)
-	sess.SetACKNoDelay(true)
-	sess.SetStreamMode(true)
-	_ = sess.SetReadBuffer(4194304)
-	_ = sess.SetWriteBuffer(4194304)
-	return sess, nil
 }
 
 func (l *links) newLinkKCP(tcp *linkTCP) *linkKCP {
@@ -163,6 +383,8 @@ func (l *links) newLinkKCP(tcp *linkTCP) *linkKCP {
 }
 
 func (l *linkKCP) dial(ctx context.Context, u *url.URL, info linkInfo, options linkOptions) (net.Conn, error) {
+	conns, sndwnd, rcvwnd, dataShards, parityShards := parseKCPParams(u)
+
 	return l.findSuitableIP(u, func(hostname string, ip net.IP, port int) (net.Conn, error) {
 		raddr := &net.UDPAddr{
 			IP:   ip,
@@ -174,30 +396,67 @@ func (l *linkKCP) dial(ctx context.Context, u *url.URL, info linkInfo, options l
 		} else {
 			localAddr = "[::]:0"
 		}
-		packetConn, err := net.ListenPacket("udp", localAddr)
-		if err != nil {
-			return nil, err
-		}
-		stunConn := newSTUNPacketConn(packetConn)
-		sess, err := kcp.NewConn2(raddr, nil, 0, 0, stunConn)
-		if err != nil {
-			_ = stunConn.Close()
-			return nil, err
-		}
-		// Best performance tuning
-		sess.SetNoDelay(1, 10, 2, 1)
-		sess.SetWindowSize(1024, 1024)
-		sess.SetMtu(1350)
-		sess.SetACKNoDelay(true)
-		sess.SetStreamMode(true)
-		_ = sess.SetReadBuffer(4194304)
-		_ = sess.SetWriteBuffer(4194304)
 
-		return sess, nil
+		dialSession := func() (net.Conn, error) {
+			packetConn, err := net.ListenPacket("udp", localAddr)
+			if err != nil {
+				return nil, err
+			}
+			stunConn := newSTUNPacketConn(packetConn)
+			sess, err := kcp.NewConn2(raddr, nil, dataShards, parityShards, stunConn)
+			if err != nil {
+				_ = stunConn.Close()
+				return nil, err
+			}
+			sess.SetNoDelay(1, 10, 2, 1)
+			sess.SetWindowSize(sndwnd, rcvwnd)
+			sess.SetMtu(1350)
+			sess.SetACKNoDelay(true)
+			sess.SetStreamMode(true)
+			_ = sess.SetReadBuffer(4194304)
+			_ = sess.SetWriteBuffer(4194304)
+			return sess, nil
+		}
+
+		if conns <= 1 {
+			return dialSession()
+		}
+
+		// Multi-connection bundle
+		var bundleID [16]byte
+		_, _ = rand.Read(bundleID[:])
+
+		sessions := make([]net.Conn, conns)
+		for i := 0; i < conns; i++ {
+			sess, err := dialSession()
+			if err != nil {
+				for j := 0; j < i; j++ {
+					_ = sessions[j].Close()
+				}
+				return nil, err
+			}
+			// Send 22-byte bundle header
+			hdr := make([]byte, 22)
+			copy(hdr[0:4], bundleMagic[:])
+			copy(hdr[4:20], bundleID[:])
+			hdr[20] = byte(i)
+			hdr[21] = byte(conns)
+			if _, err := sess.Write(hdr); err != nil {
+				_ = sess.Close()
+				for j := 0; j < i; j++ {
+					_ = sessions[j].Close()
+				}
+				return nil, err
+			}
+			sessions[i] = sess
+		}
+		return newMultiKCPConn(sessions), nil
 	})
 }
 
 func (l *linkKCP) listen(ctx context.Context, u *url.URL, sintf string) (net.Listener, error) {
+	_, _, _, dataShards, parityShards := parseKCPParams(u)
+
 	hostport := u.Host
 	if sintf != "" {
 		if host, port, err := net.SplitHostPort(hostport); err == nil {
@@ -209,12 +468,14 @@ func (l *linkKCP) listen(ctx context.Context, u *url.URL, sintf string) (net.Lis
 		return nil, err
 	}
 	stunConn := newSTUNPacketConn(packetConn)
-	listener, err := kcp.ServeConn(nil, 0, 0, stunConn)
+	listener, err := kcp.ServeConn(nil, dataShards, parityShards, stunConn)
 	if err != nil {
 		_ = stunConn.Close()
 		return nil, err
 	}
 	return &linkKCPListener{
 		Listener: listener,
+		pending:  make(map[[16]byte]*pendingBundle),
+		ready:    make(chan net.Conn, 64),
 	}, nil
 }
