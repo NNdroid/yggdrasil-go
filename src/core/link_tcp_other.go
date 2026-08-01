@@ -12,6 +12,6 @@ func (t *linkTCP) tcpContext(network, address string, c syscall.RawConn) error {
 	return nil
 }
 
-func (t *linkTCP) getControl(sintf string) func(string, string, syscall.RawConn) error {
+func (t *linkTCP) getControl(_ string, _ string, _ uint64) func(string, string, syscall.RawConn) error {
 	return t.tcpContext
 }

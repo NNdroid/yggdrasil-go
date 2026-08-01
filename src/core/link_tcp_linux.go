@@ -3,25 +3,64 @@
 package core
 
 import (
+	"strings"
 	"syscall"
+	"unsafe"
 
 	"golang.org/x/sys/unix"
 )
 
-// WARNING: This context is used both by net.Dialer and net.Listen in tcp.go
+const (
+	tcpBrutalParamsOpt = 185
+)
+
+type tcpBrutalParams struct {
+	rate uint64 // bytes per second
+	cwnd uint32 // initial congestion window (0 for default)
+}
+
+func applyTCPCongestionControl(fd uintptr, ccName string, rate uint64) error {
+	if ccName == "" {
+		return nil
+	}
+	_ = unix.SetsockoptString(int(fd), unix.IPPROTO_TCP, unix.TCP_CONGESTION, ccName)
+	if strings.EqualFold(ccName, "brutal") && rate > 0 {
+		params := tcpBrutalParams{
+			rate: rate,
+			cwnd: 0,
+		}
+		ptr := unsafe.Pointer(&params)
+		size := unsafe.Sizeof(params)
+		_, _, _ = syscall.Syscall6(
+			syscall.SYS_SETSOCKOPT,
+			fd,
+			uintptr(unix.IPPROTO_TCP),
+			uintptr(tcpBrutalParamsOpt),
+			uintptr(ptr),
+			size,
+			0,
+		)
+	}
+	return nil
+}
 
 func (t *linkTCP) tcpContext(network, address string, c syscall.RawConn) error {
 	return nil
 }
 
-func (t *linkTCP) getControl(sintf string) func(string, string, syscall.RawConn) error {
+func (t *linkTCP) getControl(sintf string, ccName string, rate uint64) func(string, string, syscall.RawConn) error {
 	return func(network, address string, c syscall.RawConn) error {
 		var err error
 		btd := func(fd uintptr) {
-			err = unix.BindToDevice(int(fd), sintf)
+			if sintf != "" {
+				err = unix.BindToDevice(int(fd), sintf)
+			}
+			if ccName != "" {
+				_ = applyTCPCongestionControl(fd, ccName, rate)
+			}
 		}
 		_ = c.Control(btd)
-		if err != nil {
+		if err != nil && sintf != "" {
 			t.core.log.Debugln("Failed to set SO_BINDTODEVICE:", sintf)
 		}
 		return t.tcpContext(network, address, c)

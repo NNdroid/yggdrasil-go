@@ -36,7 +36,7 @@ func (l *linkSOCKS) dial(_ context.Context, url *url.URL, info linkInfo, options
 		dialer, err := l.tcp.dialerFor(&net.TCPAddr{
 			IP:   ip,
 			Port: port,
-		}, info.sintf)
+		}, info.sintf, url)
 		if err != nil {
 			return nil, err
 		}

@@ -5,6 +5,9 @@ import (
 	"fmt"
 	"net"
 	"net/url"
+	"strconv"
+	"strings"
+	"syscall"
 	"time"
 
 	"github.com/Arceliar/phony"
@@ -23,8 +26,53 @@ func (l *links) newLinkTCP() *linkTCP {
 			KeepAlive: -1,
 		},
 	}
-	lt.listenconfig.Control = lt.tcpContext
+	lt.listenconfig.Control = func(network, address string, c syscall.RawConn) error { return nil }
 	return lt
+}
+
+func parseRateBytesPerSec(rateStr string) uint64 {
+	rateStr = strings.TrimSpace(strings.ToUpper(rateStr))
+	if rateStr == "" {
+		return 0
+	}
+	var mult uint64 = 1
+	if strings.HasSuffix(rateStr, "M") || strings.HasSuffix(rateStr, "MBPS") {
+		mult = 1000 * 1000 / 8
+		rateStr = strings.TrimSuffix(strings.TrimSuffix(rateStr, "MBPS"), "M")
+	} else if strings.HasSuffix(rateStr, "G") || strings.HasSuffix(rateStr, "GBPS") {
+		mult = 1000 * 1000 * 1000 / 8
+		rateStr = strings.TrimSuffix(strings.TrimSuffix(rateStr, "GBPS"), "G")
+	} else if strings.HasSuffix(rateStr, "K") || strings.HasSuffix(rateStr, "KBPS") {
+		mult = 1000 / 8
+		rateStr = strings.TrimSuffix(strings.TrimSuffix(rateStr, "KBPS"), "K")
+	} else if strings.HasSuffix(rateStr, "BPS") {
+		mult = 1 / 8
+		rateStr = strings.TrimSuffix(rateStr, "BPS")
+	}
+
+	val, err := strconv.ParseUint(rateStr, 10, 64)
+	if err != nil {
+		return 0
+	}
+	return val * mult
+}
+
+func parseTCPCongestionParams(u *url.URL) (cc string, rate uint64) {
+	if u == nil {
+		return "", 0
+	}
+	q := u.Query()
+	cc = q.Get("cc")
+	if cc == "" {
+		cc = q.Get("congestion")
+	}
+	rateStr := q.Get("rate")
+	if r := q.Get("brutal"); r != "" {
+		cc = "brutal"
+		rateStr = r
+	}
+	rate = parseRateBytesPerSec(rateStr)
+	return
 }
 
 func (l *linkTCP) dial(ctx context.Context, url *url.URL, info linkInfo, options linkOptions) (net.Conn, error) {
@@ -33,7 +81,7 @@ func (l *linkTCP) dial(ctx context.Context, url *url.URL, info linkInfo, options
 			IP:   ip,
 			Port: port,
 		}
-		dialer, err := l.tcp.dialerFor(addr, info.sintf)
+		dialer, err := l.tcp.dialerFor(addr, info.sintf, url)
 		if err != nil {
 			return nil, err
 		}
@@ -48,10 +96,15 @@ func (l *linkTCP) listen(ctx context.Context, url *url.URL, sintf string) (net.L
 			hostport = fmt.Sprintf("[%s%%%s]:%s", host, sintf, port)
 		}
 	}
-	return l.listenconfig.Listen(ctx, "tcp", hostport)
+	cc, rate := parseTCPCongestionParams(url)
+	lc := &net.ListenConfig{
+		KeepAlive: -1,
+		Control:   l.getControl(sintf, cc, rate),
+	}
+	return lc.Listen(ctx, "tcp", hostport)
 }
 
-func (l *linkTCP) dialerFor(dst *net.TCPAddr, sintf string) (*net.Dialer, error) {
+func (l *linkTCP) dialerFor(dst *net.TCPAddr, sintf string, u *url.URL) (*net.Dialer, error) {
 	if dst.IP.IsLinkLocalUnicast() {
 		if sintf != "" {
 			dst.Zone = sintf
@@ -60,19 +113,16 @@ func (l *linkTCP) dialerFor(dst *net.TCPAddr, sintf string) (*net.Dialer, error)
 			return nil, fmt.Errorf("link-local address requires a zone")
 		}
 	}
+	cc, rate := parseTCPCongestionParams(u)
 	dialer := &net.Dialer{
 		Timeout:   time.Second * 5,
 		KeepAlive: -1,
-		Control:   l.tcpContext,
+		Control:   l.getControl(sintf, cc, rate),
 	}
 	if sintf != "" {
-		dialer.Control = l.getControl(sintf)
+		dialer.Control = l.getControl(sintf, cc, rate)
 		ief, err := net.InterfaceByName(sintf)
 		if err != nil {
-			// On mobile platforms (Android/iOS), InterfaceByName may fail due to
-			// permission restrictions (SELinux on Android), but for link-local
-			// addresses with zone identifiers, the zone is sufficient for routing
-			// and we can proceed without source binding
 			if dst.IP.IsLinkLocalUnicast() && dst.Zone != "" {
 				return dialer, nil
 			}
@@ -83,7 +133,6 @@ func (l *linkTCP) dialerFor(dst *net.TCPAddr, sintf string) (*net.Dialer, error)
 		}
 		addrs, err := ief.Addrs()
 		if err != nil {
-			// Same mobile platform handling for address lookup failures
 			if dst.IP.IsLinkLocalUnicast() && dst.Zone != "" {
 				return dialer, nil
 			}
@@ -115,7 +164,6 @@ func (l *linkTCP) dialerFor(dst *net.TCPAddr, sintf string) (*net.Dialer, error)
 			}
 		}
 		if dialer.LocalAddr == nil {
-			// Proceed without source binding if link-local
 			if dst.IP.IsLinkLocalUnicast() && dst.Zone != "" {
 				return dialer, nil
 			}

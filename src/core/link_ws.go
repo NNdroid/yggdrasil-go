@@ -174,7 +174,7 @@ func (l *linkWS) dial(ctx context.Context, url *url.URL, info linkInfo, options 
 			IP:   ip,
 			Port: port,
 		}
-		dialer, err := l.tcp.dialerFor(addr, info.sintf)
+		dialer, err := l.tcp.dialerFor(addr, info.sintf, url)
 		if err != nil {
 			return nil, err
 		}
