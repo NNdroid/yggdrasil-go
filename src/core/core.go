@@ -1,6 +1,7 @@
 package core
 
 import (
+	"bytes"
 	"context"
 	"crypto/ed25519"
 	"crypto/tls"
@@ -8,6 +9,7 @@ import (
 	"io"
 	"net"
 	"net/url"
+	"sync/atomic"
 
 	iwe "github.com/Arceliar/ironwood/encrypted"
 	iwn "github.com/Arceliar/ironwood/network"
@@ -44,7 +46,8 @@ type Core struct {
 		_allowedPublicKeys map[[32]byte]struct{}      // configurable after startup
 		groupPassword      string                     // immutable after startup
 	}
-	pathNotify func(ed25519.PublicKey)
+	pathNotify            func(ed25519.PublicKey)
+	duplicateToAllPeers   atomic.Bool
 }
 
 func New(cert *tls.Certificate, logger Logger, opts ...SetupOption) (*Core, error) {
@@ -207,7 +210,18 @@ func (c *Core) ReadFrom(p []byte) (n int, from net.Addr, err error) {
 	}
 }
 
+func (c *Core) SetDuplicateToAllPeers(enable bool) {
+	c.duplicateToAllPeers.Store(enable)
+}
+
+func (c *Core) DuplicateToAllPeers() bool {
+	return c.duplicateToAllPeers.Load()
+}
+
 func (c *Core) WriteTo(p []byte, addr net.Addr) (n int, err error) {
+	if c.duplicateToAllPeers.Load() {
+		return c.WriteToAllPeers(p, addr)
+	}
 	buf := allocBytes(0)
 	defer func() { freeBytes(buf) }()
 	buf = append(buf, typeSessionTraffic)
@@ -215,6 +229,37 @@ func (c *Core) WriteTo(p []byte, addr net.Addr) (n int, err error) {
 	n, err = c.PacketConn.WriteTo(buf, addr)
 	if n > 0 {
 		n -= 1
+	}
+	return
+}
+
+func (c *Core) WriteToAllPeers(p []byte, addr net.Addr) (n int, err error) {
+	buf := allocBytes(0)
+	defer func() { freeBytes(buf) }()
+	buf = append(buf, typeSessionTraffic)
+	buf = append(buf, p...)
+	n, err = c.PacketConn.WriteTo(buf, addr)
+	if n > 0 {
+		n -= 1
+	}
+
+	peers := c.GetPeers()
+	if len(peers) > 1 {
+		data := make([]byte, len(p))
+		copy(data, p)
+		go func() {
+			for _, peer := range peers {
+				peerKey := peer.Key
+				targetAddr := iwt.Addr(peerKey)
+				if targetAddrStr, ok := addr.(iwt.Addr); !ok || !bytes.Equal(targetAddr, targetAddrStr) {
+					dupBuf := allocBytes(0)
+					dupBuf = append(dupBuf, typeSessionTraffic)
+					dupBuf = append(dupBuf, data...)
+					_, _ = c.PacketConn.WriteTo(dupBuf, targetAddr)
+					freeBytes(dupBuf)
+				}
+			}
+		}()
 	}
 	return
 }
