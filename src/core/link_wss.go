@@ -46,6 +46,17 @@ func (l *linkWSS) dial(ctx context.Context, url *url.URL, info linkInfo, options
 		if err != nil {
 			return nil, err
 		}
+
+		subprotos, ua, customHost := parseWSOptions(url)
+		if customHost == "" {
+			customHost = hostname
+		}
+
+		headers := make(http.Header)
+		headers.Set("User-Agent", ua)
+		headers.Set("Accept-Language", "en-US,en;q=0.9")
+		headers.Set("Cache-Control", "no-cache")
+
 		wsconn, _, err := websocket.Dial(ctx, u.String(), &websocket.DialOptions{
 			HTTPClient: &http.Client{
 				Transport: &http.Transport{
@@ -55,8 +66,9 @@ func (l *linkWSS) dial(ctx context.Context, url *url.URL, info linkInfo, options
 					TLSClientConfig: tlsconfig,
 				},
 			},
-			Subprotocols: []string{"ygg-ws"},
-			Host:         hostname,
+			HTTPHeader:   headers,
+			Subprotocols: subprotos,
+			Host:         customHost,
 		})
 		if err != nil {
 			return nil, err

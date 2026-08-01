@@ -6,11 +6,28 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"strings"
 	"time"
 
 	"github.com/Arceliar/phony"
 	"github.com/coder/websocket"
 )
+
+const fallbackHTML = `<!DOCTYPE html>
+<html>
+<head>
+<title>Welcome to nginx!</title>
+<style>
+    body { width: 35em; margin: 0 auto; font-family: Tahoma, Verdana, Arial, sans-serif; }
+</style>
+</head>
+<body>
+<h1>Welcome to nginx!</h1>
+<p>If you see this page, the nginx web server is successfully installed and working. Further configuration is required.</p>
+<p>For online documentation and support please refer to <a href="http://nginx.org/">nginx.org</a>.</p>
+<p><em>Thank you for using nginx.</em></p>
+</body>
+</html>`
 
 type linkWS struct {
 	phony.Inbox
@@ -55,19 +72,17 @@ func (l *linkWSListener) Close() error {
 }
 
 func (s *wsServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	if r.URL.Path == "/health" || r.URL.Path == "/healthz" {
+	// If not a WebSocket upgrade request or probe scanner, return realistic Nginx HTML index page
+	if !strings.EqualFold(r.Header.Get("Upgrade"), "websocket") {
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.Header().Set("Server", "nginx/1.24.0")
 		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte("OK"))
+		_, _ = w.Write([]byte(fallbackHTML))
 		return
 	}
 
 	c, err := websocket.Accept(w, r, s.acceptOptions)
 	if err != nil {
-		return
-	}
-
-	if c.Subprotocol() != "ygg-ws" {
-		c.Close(websocket.StatusPolicyViolation, "client must speak the ygg-ws subprotocol")
 		return
 	}
 
@@ -86,9 +101,37 @@ func (l *links) newLinkWS() *linkWS {
 	return lt
 }
 
+func parseWSOptions(u *url.URL) (subprotocols []string, userAgent string, customHost string) {
+	q := u.Query()
+	subproto := q.Get("subprotocol")
+	if subproto == "" {
+		subproto = q.Get("subproto")
+	}
+	switch strings.ToLower(subproto) {
+	case "none", "disable", "off":
+		subprotocols = nil
+	case "":
+		subprotocols = []string{"ygg-ws"}
+	default:
+		subprotocols = []string{subproto}
+	}
+
+	userAgent = q.Get("useragent")
+	if userAgent == "" {
+		userAgent = q.Get("ua")
+	}
+	if userAgent == "" {
+		userAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+	}
+
+	customHost = q.Get("host")
+	return
+}
+
 func wsAcceptOptions(url *url.URL) *websocket.AcceptOptions {
+	subprotos, _, _ := parseWSOptions(url)
 	opts := &websocket.AcceptOptions{
-		Subprotocols: []string{"ygg-ws"},
+		Subprotocols: subprotos,
 	}
 	for _, origin := range url.Query()["origin"] {
 		switch origin {
@@ -117,6 +160,17 @@ func (l *linkWS) dial(ctx context.Context, url *url.URL, info linkInfo, options 
 		if err != nil {
 			return nil, err
 		}
+
+		subprotos, ua, customHost := parseWSOptions(url)
+		if customHost == "" {
+			customHost = hostname
+		}
+
+		headers := make(http.Header)
+		headers.Set("User-Agent", ua)
+		headers.Set("Accept-Language", "en-US,en;q=0.9")
+		headers.Set("Cache-Control", "no-cache")
+
 		wsconn, _, err := websocket.Dial(ctx, u.String(), &websocket.DialOptions{
 			HTTPClient: &http.Client{
 				Transport: &http.Transport{
@@ -125,8 +179,9 @@ func (l *linkWS) dial(ctx context.Context, url *url.URL, info linkInfo, options 
 					DialContext: dialer.DialContext,
 				},
 			},
-			Subprotocols: []string{"ygg-ws"},
-			Host:         hostname,
+			HTTPHeader:   headers,
+			Subprotocols: subprotos,
+			Host:         customHost,
 		})
 		if err != nil {
 			return nil, err

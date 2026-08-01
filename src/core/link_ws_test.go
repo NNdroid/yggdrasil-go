@@ -2,6 +2,7 @@ package core
 
 import (
 	"context"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -66,9 +67,6 @@ func TestWSAcceptOptionsOriginQuery(t *testing.T) {
 			}
 			if strings.Join(opts.OriginPatterns, ",") != strings.Join(tc.originPatterns, ",") {
 				t.Fatalf("OriginPatterns = %#v, want %#v", opts.OriginPatterns, tc.originPatterns)
-			}
-			if strings.Join(opts.Subprotocols, ",") != "ygg-ws" {
-				t.Fatalf("Subprotocols = %#v, want [ygg-ws]", opts.Subprotocols)
 			}
 		})
 	}
@@ -148,5 +146,55 @@ func TestWSServerOriginPolicy(t *testing.T) {
 				t.Fatal("websocket dial succeeded, want origin rejection")
 			}
 		})
+	}
+}
+
+func TestWSHTTPProbeFallback(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	ch := make(chan *linkWSConn, 1)
+	u, _ := url.Parse("ws://127.0.0.1:0")
+	server := httptest.NewServer(&wsServer{
+		ch:            ch,
+		ctx:           ctx,
+		acceptOptions: wsAcceptOptions(u),
+	})
+	defer server.Close()
+
+	resp, err := http.Get(server.URL + "/probe-test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected status 200 OK for HTTP probe, got %d", resp.StatusCode)
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(body), "Welcome to nginx!") {
+		t.Fatalf("expected Nginx fallback page, got: %s", string(body))
+	}
+}
+
+func TestWSCustomSubprotocol(t *testing.T) {
+	t.Parallel()
+
+	uNone, _ := url.Parse("ws://127.0.0.1:0?subprotocol=none")
+	subNone, _, _ := parseWSOptions(uNone)
+	if subNone != nil {
+		t.Fatalf("expected nil subprotocols for subprotocol=none, got %#v", subNone)
+	}
+
+	uCustom, _ := url.Parse("ws://127.0.0.1:0?subprotocol=chat")
+	subCustom, _, _ := parseWSOptions(uCustom)
+	if len(subCustom) != 1 || subCustom[0] != "chat" {
+		t.Fatalf("expected [chat] subprotocol, got %#v", subCustom)
 	}
 }
