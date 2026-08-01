@@ -29,17 +29,8 @@ func applyTCPCongestionControl(fd uintptr, ccName string, rate uint64) error {
 			rate: rate,
 			cwnd: 0,
 		}
-		ptr := unsafe.Pointer(&params)
-		size := unsafe.Sizeof(params)
-		_, _, _ = syscall.Syscall6(
-			syscall.SYS_SETSOCKOPT,
-			fd,
-			uintptr(unix.IPPROTO_TCP),
-			uintptr(tcpBrutalParamsOpt),
-			uintptr(ptr),
-			size,
-			0,
-		)
+		b := (*[12]byte)(unsafe.Pointer(&params))[:]
+		_ = unix.SetsockoptString(int(fd), unix.IPPROTO_TCP, tcpBrutalParamsOpt, string(b))
 	}
 	return nil
 }
